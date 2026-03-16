@@ -430,3 +430,30 @@ jobs:
               repo: context.repo.repo,
               body: body
             });
+            slack-notify:
+              name: "Slack Notification"
+              uns-on: ubuntu-latest
+              needs: [baseline-test, load-test, stress-test]
+              if: always()
+
+              
+              steps:
+                 - name: Send Slack Notification
+                   uses: rtCamp/action-slack-notify@v2
+                   env:
+                      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+                      SLACK_COLOR: ${{ needs.baseline-test.result == 'failure' || needs.load-test.result == 'failure' || needs.stress-test.result == 'failure' && 'danger' || 'good' }}
+                      
+                     SLACK_TITLE: "DemoBlaze Performance Tests Summary"
+                     SLACK_MESSAGE: |
+                       *Baseline Test:* ${{ needs.baseline-test.result }}
+                       *Load Test:* ${{ needs.load-test.result }}
+                       *Stress Test:* ${{ needs.stress-test.result }}
+                      View full artifacts in GitHub Actions.
+
+
+
+
+          
+    
+            
