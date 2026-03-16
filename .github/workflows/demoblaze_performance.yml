@@ -403,9 +403,8 @@ jobs:
   notify:
     name: "Post Results Summary"
     runs-on: ubuntu-latest
-    needs: [baseline-test, load-test, stress-test, endurance-test]
-    # Always run this job as long as at least one upstream job ran
-    if: always()
+    needs: [baseline-test]   # ← only depend on baseline for PR events
+    if: always() && !cancelled()
 
     steps:
       # ── Determine which tests actually ran and their outcomes ──
