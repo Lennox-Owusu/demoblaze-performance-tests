@@ -397,63 +397,184 @@ jobs:
           retention-days: 30
 
   # ─────────────────────────────────────────────────────────────
-  # JOB 5: NOTIFY — Summary comment on PR
+  # JOB 5: NOTIFY — PR comment + Slack + Email
+  # Runs on: all event types, after whichever jobs ran
   # ─────────────────────────────────────────────────────────────
   notify:
     name: "Post Results Summary"
     runs-on: ubuntu-latest
-    needs: [baseline-test]
-    if: always() && github.event_name == 'pull_request'
+    needs: [baseline-test, load-test, stress-test, endurance-test]
+    # Always run this job as long as at least one upstream job ran
+    if: always()
 
     steps:
+      # ── Determine which tests actually ran and their outcomes ──
+      - name: Build summary variables
+        id: summary
+        run: |
+          # Resolve each job result (skipped jobs show as 'skipped')
+          BASELINE="${{ needs.baseline-test.result }}"
+          LOAD="${{ needs.load-test.result }}"
+          STRESS="${{ needs.stress-test.result }}"
+          ENDURANCE="${{ needs.endurance-test.result }}"
+
+          # Overall status: failed/cancelled if any non-skipped job failed
+          OVERALL="passed"
+          for RESULT in "$BASELINE" "$LOAD" "$STRESS" "$ENDURANCE"; do
+            if [[ "$RESULT" == "failure" || "$RESULT" == "cancelled" ]]; then
+              OVERALL="failed"
+              break
+            fi
+          done
+
+          echo "baseline=$BASELINE"   >> $GITHUB_OUTPUT
+          echo "load=$LOAD"           >> $GITHUB_OUTPUT
+          echo "stress=$STRESS"       >> $GITHUB_OUTPUT
+          echo "endurance=$ENDURANCE" >> $GITHUB_OUTPUT
+          echo "overall=$OVERALL"     >> $GITHUB_OUTPUT
+
+          # Emoji helpers used in messages below
+          if [[ "$OVERALL" == "passed" ]]; then
+            echo "overall_emoji=✅" >> $GITHUB_OUTPUT
+            echo "slack_color=good" >> $GITHUB_OUTPUT
+          else
+            echo "overall_emoji=❌" >> $GITHUB_OUTPUT
+            echo "slack_color=danger" >> $GITHUB_OUTPUT
+          fi
+
+      # ── 1. PR comment (pull_request events only) ──────────────
       - name: Post PR Comment with Results Summary
+        if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
         with:
           script: |
-            const body = `## 🚀 DemoBlaze Performance Test Results
+            const baseline  = "${{ steps.summary.outputs.baseline }}";
+            const load      = "${{ steps.summary.outputs.load }}";
+            const stress    = "${{ steps.summary.outputs.stress }}";
+            const endurance = "${{ steps.summary.outputs.endurance }}";
+            const overall   = "${{ steps.summary.outputs.overall }}";
+            const emoji     = overall === "passed" ? "✅" : "❌";
 
-            | Test | Status | Details |
-            |------|--------|---------|
-            | Baseline (50 users) | ${{ needs.baseline-test.result == 'success' && '✅ PASSED' || '❌ FAILED' }} | See artifacts for HTML report |
+            const statusIcon = (r) =>
+              r === "success"   ? "✅ PASSED"  :
+              r === "failure"   ? "❌ FAILED"  :
+              r === "cancelled" ? "⚠️ CANCELLED" : "⏭️ SKIPPED";
 
-            ### Thresholds
-            | Metric | Target | Result |
-            |--------|--------|--------|
-            | Avg Response Time | < 2000ms | See report |
-            | Error Rate | < 1% | See report |
+            const body = `## 🚀 DemoBlaze Performance Test Results — ${emoji} ${overall.toUpperCase()}
 
-            📊 Download the full HTML Dashboard report from the **Actions > Artifacts** section.
+            | Test | Users | Status |
+            |------|-------|--------|
+            | Baseline  | 50  | ${statusIcon(baseline)}  |
+            | Load      | 150 | ${statusIcon(load)}      |
+            | Stress    | 300 | ${statusIcon(stress)}    |
+            | Endurance | 150 | ${statusIcon(endurance)} |
+
+            ### Thresholds Applied
+            | Metric | Target |
+            |--------|--------|
+            | Avg Response Time | < 2000ms |
+            | Error Rate | < 1% |
+
+            📊 Download full HTML Dashboard reports from **Actions → Artifacts**.
+            🔗 [View Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
             `;
+
             github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
               body: body
             });
-            slack-notify:
-              name: "Slack Notification"
-              uns-on: ubuntu-latest
-              needs: [baseline-test, load-test, stress-test]
-              if: always()
 
-              
-              steps:
-                 - name: Send Slack Notification
-                   uses: rtCamp/action-slack-notify@v2
-                   env:
-                      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
-                      SLACK_COLOR: ${{ needs.baseline-test.result == 'failure' || needs.load-test.result == 'failure' || needs.stress-test.result == 'failure' && 'danger' || 'good' }}
-                      
-                     SLACK_TITLE: "DemoBlaze Performance Tests Summary"
-                     SLACK_MESSAGE: |
-                       *Baseline Test:* ${{ needs.baseline-test.result }}
-                       *Load Test:* ${{ needs.load-test.result }}
-                       *Stress Test:* ${{ needs.stress-test.result }}
-                      View full artifacts in GitHub Actions.
+      # ── 2. Slack notification (all event types) ───────────────
+      # Requires secret: SLACK_WEBHOOK_URL
+      # Set up at: Slack → Apps → Incoming Webhooks → Add to Workspace
+      - name: Notify Slack
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": "*DemoBlaze Performance Tests — ${{ steps.summary.outputs.overall_emoji }} ${{ steps.summary.outputs.overall }}*",
+              "attachments": [
+                {
+                  "color": "${{ steps.summary.outputs.slack_color }}",
+                  "fields": [
+                    {
+                      "title": "Baseline (50 users)",
+                      "value": "${{ steps.summary.outputs.baseline }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Load (150 users)",
+                      "value": "${{ steps.summary.outputs.load }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Stress (300 users)",
+                      "value": "${{ steps.summary.outputs.stress }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Endurance (150 users / 30 min)",
+                      "value": "${{ steps.summary.outputs.endurance }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Triggered By",
+                      "value": "${{ github.event_name }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Branch",
+                      "value": "${{ github.ref_name }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Run URL",
+                      "value": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+                      "short": false
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
 
+      # ── 3. Email notification (all event types) ───────────────
+      # Requires secrets: EMAIL_USERNAME, EMAIL_PASSWORD, NOTIFY_EMAIL
+      # Gmail users: enable 2FA then generate an App Password at
+      # https://myaccount.google.com/apppasswords and store it as EMAIL_PASSWORD
+      - name: Send Email Notification
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "DemoBlaze Perf Tests — ${{ steps.summary.outputs.overall_emoji }} ${{ steps.summary.outputs.overall }} (${{ github.event_name }} / ${{ github.ref_name }})"
+          to: ${{ secrets.NOTIFY_EMAIL }}
+          from: "GitHub Actions <${{ secrets.EMAIL_USERNAME }}>"
+          body: |
+            DemoBlaze Performance Test run completed.
 
+            Overall Status : ${{ steps.summary.outputs.overall_emoji }} ${{ steps.summary.outputs.overall }}
+            Triggered By   : ${{ github.event_name }}
+            Branch         : ${{ github.ref_name }}
+            Commit         : ${{ github.sha }}
 
+            ── Test Results ──────────────────────────────
+            Baseline  (50 users)          : ${{ steps.summary.outputs.baseline }}
+            Load      (150 users)         : ${{ steps.summary.outputs.load }}
+            Stress    (300 users)         : ${{ steps.summary.outputs.stress }}
+            Endurance (150 users / 30min) : ${{ steps.summary.outputs.endurance }}
 
-          
-    
-            
+            ── Thresholds Applied ────────────────────────
+            Avg Response Time : < 2000ms
+            Error Rate        : < 1%
+
+            ── Links ─────────────────────────────────────
+            Full run & artifacts:
+            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
