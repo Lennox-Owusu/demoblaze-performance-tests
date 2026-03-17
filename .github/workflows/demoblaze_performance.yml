@@ -82,7 +82,7 @@ jobs:
         id: baseline-thresholds
         run: |
           python3 << 'EOF'
-          import csv, sys, os, json
+          import csv, sys, os
 
           jtl_file = "${{ env.RESULTS_DIR }}/baseline.jtl"
           EXCLUDED_SAMPLER = "07 - Checkout (Place Order)"
@@ -113,23 +113,17 @@ jobs:
           elapsed_values.sort()
           avg_response = total_elapsed / total_count
           error_rate = (error_count / total_count) * 100
-          p90_idx = int(total_count * 0.90) - 1
-          p95_idx = int(total_count * 0.95) - 1
-          p99_idx = int(total_count * 0.99) - 1
-          p90 = elapsed_values[max(p90_idx, 0)]
-          p95 = elapsed_values[max(p95_idx, 0)]
-          p99 = elapsed_values[max(p99_idx, 0)]
+          p90 = elapsed_values[max(int(total_count * 0.90) - 1, 0)]
+          p95 = elapsed_values[max(int(total_count * 0.95) - 1, 0)]
+          p99 = elapsed_values[max(int(total_count * 0.99) - 1, 0)]
           min_resp = elapsed_values[0]
           max_resp = elapsed_values[-1]
 
           print(f"Total Requests  : {total_count} (excl. Checkout)")
           print(f"Avg Response    : {avg_response:.0f}ms")
           print(f"Error Rate      : {error_rate:.2f}%")
-          print(f"P90             : {p90}ms")
-          print(f"P95             : {p95}ms")
-          print(f"P99             : {p99}ms")
-          print(f"Min             : {min_resp}ms")
-          print(f"Max             : {max_resp}ms")
+          print(f"P90 / P95 / P99 : {p90}ms / {p95}ms / {p99}ms")
+          print(f"Min / Max       : {min_resp}ms / {max_resp}ms")
 
           with open(os.environ['GITHUB_OUTPUT'], 'a') as fh:
               print(f"avg_response={avg_response:.0f}", file=fh)
@@ -508,92 +502,127 @@ jobs:
               body: body
             });
 
-      # ── 2. Build Slack payload with real metrics ───────────────
+      # ── 2. Build Slack payload ─────────────────────────────────
+      # All ${{ }} expressions are resolved into env vars BEFORE the
+      # JS runs, so the JS engine never sees raw }} sequences.
       - name: Build Slack payload
         id: slack-payload
         uses: actions/github-script@v7
+        env:
+          OVERALL:          ${{ steps.summary.outputs.overall }}
+          SHORT_SHA:        ${{ steps.summary.outputs.short_sha }}
+          BASELINE_RESULT:  ${{ needs.baseline-test.result }}
+          LOAD_RESULT:      ${{ needs.load-test.result }}
+          STRESS_RESULT:    ${{ needs.stress-test.result }}
+          ENDURANCE_RESULT: ${{ needs.endurance-test.result }}
+          TRIGGER:          ${{ github.event_name }}
+          REPO:             ${{ github.repository }}
+          BRANCH:           ${{ github.ref_name }}
+          RUN_URL:          ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_NUMBER:       ${{ github.run_number }}
+          WORKFLOW:         ${{ github.workflow }}
+          # Baseline metrics (empty string when job was skipped)
+          B_AVG:    ${{ needs.baseline-test.outputs.avg_response }}
+          B_ERR:    ${{ needs.baseline-test.outputs.error_rate }}
+          B_TOTAL:  ${{ needs.baseline-test.outputs.total_requests }}
+          B_P90:    ${{ needs.baseline-test.outputs.p90 }}
+          B_P95:    ${{ needs.baseline-test.outputs.p95 }}
+          B_P99:    ${{ needs.baseline-test.outputs.p99 }}
+          B_MIN:    ${{ needs.baseline-test.outputs.min_response }}
+          B_MAX:    ${{ needs.baseline-test.outputs.max_response }}
+          B_ERRORS: ${{ needs.baseline-test.outputs.error_count }}
+          # Load metrics
+          L_AVG:    ${{ needs.load-test.outputs.avg_response }}
+          L_ERR:    ${{ needs.load-test.outputs.error_rate }}
+          L_TOTAL:  ${{ needs.load-test.outputs.total_requests }}
+          L_P90:    ${{ needs.load-test.outputs.p90 }}
+          L_P95:    ${{ needs.load-test.outputs.p95 }}
         with:
           script: |
-            const baseline  = "${{ needs.baseline-test.result }}";
-            const load      = "${{ needs.load-test.result }}";
-            const stress    = "${{ needs.stress-test.result }}";
-            const endurance = "${{ needs.endurance-test.result }}";
-            const overall   = "${{ steps.summary.outputs.overall }}";
-            const shortSha  = "${{ steps.summary.outputs.short_sha }}";
+            const overall         = process.env.OVERALL;
+            const shortSha        = process.env.SHORT_SHA;
+            const baseline        = process.env.BASELINE_RESULT;
+            const load            = process.env.LOAD_RESULT;
+            const stress          = process.env.STRESS_RESULT;
+            const endurance       = process.env.ENDURANCE_RESULT;
+            const trigger         = process.env.TRIGGER;
+            const repo            = process.env.REPO;
+            const branch          = process.env.BRANCH;
+            const runUrl          = process.env.RUN_URL;
+            const runNumber       = process.env.RUN_NUMBER;
+            const workflow        = process.env.WORKFLOW;
 
-            // Metrics from baseline threshold step (only populated when baseline ran)
-            const b_avg    = "${{ needs.baseline-test.outputs.avg_response || 'N/A' }}";
-            const b_err    = "${{ needs.baseline-test.outputs.error_rate || 'N/A' }}";
-            const b_total  = "${{ needs.baseline-test.outputs.total_requests || 'N/A' }}";
-            const b_p90    = "${{ needs.baseline-test.outputs.p90 || 'N/A' }}";
-            const b_p95    = "${{ needs.baseline-test.outputs.p95 || 'N/A' }}";
-            const b_p99    = "${{ needs.baseline-test.outputs.p99 || 'N/A' }}";
-            const b_min    = "${{ needs.baseline-test.outputs.min_response || 'N/A' }}";
-            const b_max    = "${{ needs.baseline-test.outputs.max_response || 'N/A' }}";
-            const b_errors = "${{ needs.baseline-test.outputs.error_count || 'N/A' }}";
+            const fmt = (v, unit) => v ? `${v}${unit}` : 'N/A';
 
-            const l_avg    = "${{ needs.load-test.outputs.avg_response || 'N/A' }}";
-            const l_err    = "${{ needs.load-test.outputs.error_rate || 'N/A' }}";
-            const l_total  = "${{ needs.load-test.outputs.total_requests || 'N/A' }}";
-            const l_p90    = "${{ needs.load-test.outputs.p90 || 'N/A' }}";
-            const l_p95    = "${{ needs.load-test.outputs.p95 || 'N/A' }}";
+            const bAvg    = fmt(process.env.B_AVG,    'ms');
+            const bErr    = fmt(process.env.B_ERR,    '%');
+            const bTotal  = process.env.B_TOTAL  || 'N/A';
+            const bP90    = fmt(process.env.B_P90,    'ms');
+            const bP95    = fmt(process.env.B_P95,    'ms');
+            const bP99    = fmt(process.env.B_P99,    'ms');
+            const bMin    = fmt(process.env.B_MIN,    'ms');
+            const bMax    = fmt(process.env.B_MAX,    'ms');
+            const bErrors = process.env.B_ERRORS || 'N/A';
+
+            const lAvg    = fmt(process.env.L_AVG,    'ms');
+            const lErr    = fmt(process.env.L_ERR,    '%');
+            const lTotal  = process.env.L_TOTAL  || 'N/A';
+            const lP90    = fmt(process.env.L_P90,    'ms');
+            const lP95    = fmt(process.env.L_P95,    'ms');
 
             const passed = overall === "passed";
+            const color  = passed ? "#2eb886" : "#e01e5a";
 
-            const statusText = (r) =>
-              r === "success"   ? "✅  Passed"    :
-              r === "failure"   ? "❌  Failed"    :
-              r === "cancelled" ? "⚠️  Cancelled" : "⏭️  Skipped";
-
-            const color       = passed ? "#2eb886" : "#e01e5a";
-            const headerEmoji = passed ? "✅" : "❌";
             const headerLabel = passed
               ? "All Performance Gates Passed"
               : "Performance Gate Failure Detected";
+
+            const headerEmoji = passed ? "✅" : "❌";
 
             const triggerLabel = {
               push:              "Push",
               pull_request:      "Pull Request",
               schedule:          "Scheduled (Nightly)",
               workflow_dispatch: "Manual Trigger"
-            }["${{ github.event_name }}"] || "${{ github.event_name }}";
+            }[trigger] || trigger;
 
-            // Build metrics block only if baseline ran
-            const metricsBlocks = baseline !== "skipped" ? [
+            const statusText = (r) =>
+              r === "success"   ? "✅  Passed"    :
+              r === "failure"   ? "❌  Failed"    :
+              r === "cancelled" ? "⚠️  Cancelled" : "⏭️  Skipped";
+
+            const baselineMetricBlocks = (baseline === "success" || baseline === "failure") ? [
               { type: "divider" },
               {
                 type: "section",
-                text: { type: "mrkdwn", text: "*📊 Baseline Metrics (50 users)*" }
+                text: { type: "mrkdwn", text: "*📊 Baseline Metrics  (50 users)*" }
               },
               {
                 type: "section",
                 fields: [
-                  { type: "mrkdwn", text: `*Total Requests*\n${b_total}` },
-                  { type: "mrkdwn", text: `*Avg Response*\n${b_avg !== 'N/A' ? b_avg + 'ms' : 'N/A'}` },
-                  { type: "mrkdwn", text: `*Error Rate*\n${b_err !== 'N/A' ? b_err + '%' : 'N/A'}` },
-                  { type: "mrkdwn", text: `*Errors*\n${b_errors}` },
-                  { type: "mrkdwn", text: `*P90*\n${b_p90 !== 'N/A' ? b_p90 + 'ms' : 'N/A'}` },
-                  { type: "mrkdwn", text: `*P95*\n${b_p95 !== 'N/A' ? b_p95 + 'ms' : 'N/A'}` },
-                  { type: "mrkdwn", text: `*P99*\n${b_p99 !== 'N/A' ? b_p99 + 'ms' : 'N/A'}` },
-                  { type: "mrkdwn", text: `*Min / Max*\n${b_min !== 'N/A' ? b_min + 'ms' : 'N/A'} / ${b_max !== 'N/A' ? b_max + 'ms' : 'N/A'}` },
+                  { type: "mrkdwn", text: `*Total Requests*\n${bTotal}` },
+                  { type: "mrkdwn", text: `*Errors*\n${bErrors}` },
+                  { type: "mrkdwn", text: `*Avg Response*\n${bAvg}` },
+                  { type: "mrkdwn", text: `*Error Rate*\n${bErr}` },
+                  { type: "mrkdwn", text: `*P90 / P95 / P99*\n${bP90} / ${bP95} / ${bP99}` },
+                  { type: "mrkdwn", text: `*Min / Max*\n${bMin} / ${bMax}` }
                 ]
               }
             ] : [];
 
-            const loadMetricsBlocks = load !== "skipped" && load !== "cancelled" ? [
+            const loadMetricBlocks = (load === "success" || load === "failure") ? [
               { type: "divider" },
               {
                 type: "section",
-                text: { type: "mrkdwn", text: "*📊 Load Metrics (150 users)*" }
+                text: { type: "mrkdwn", text: "*📊 Load Metrics  (150 users)*" }
               },
               {
                 type: "section",
                 fields: [
-                  { type: "mrkdwn", text: `*Total Requests*\n${l_total}` },
-                  { type: "mrkdwn", text: `*Avg Response*\n${l_avg !== 'N/A' ? l_avg + 'ms' : 'N/A'}` },
-                  { type: "mrkdwn", text: `*Error Rate*\n${l_err !== 'N/A' ? l_err + '%' : 'N/A'}` },
-                  { type: "mrkdwn", text: `*P90*\n${l_p90 !== 'N/A' ? l_p90 + 'ms' : 'N/A'}` },
-                  { type: "mrkdwn", text: `*P95*\n${l_p95 !== 'N/A' ? l_p95 + 'ms' : 'N/A'}` },
+                  { type: "mrkdwn", text: `*Total Requests*\n${lTotal}` },
+                  { type: "mrkdwn", text: `*Avg Response*\n${lAvg}` },
+                  { type: "mrkdwn", text: `*Error Rate*\n${lErr}` },
+                  { type: "mrkdwn", text: `*P90 / P95*\n${lP90} / ${lP95}` }
                 ]
               }
             ] : [];
@@ -614,8 +643,8 @@ jobs:
                     {
                       type: "section",
                       fields: [
-                        { type: "mrkdwn", text: `*Repository*\n${{ github.repository }}` },
-                        { type: "mrkdwn", text: `*Branch*\n\`${{ github.ref_name }}\`` },
+                        { type: "mrkdwn", text: `*Repository*\n${repo}` },
+                        { type: "mrkdwn", text: `*Branch*\n\`${branch}\`` },
                         { type: "mrkdwn", text: `*Triggered By*\n${triggerLabel}` },
                         { type: "mrkdwn", text: `*Commit*\n\`${shortSha}\`` }
                       ]
@@ -634,33 +663,15 @@ jobs:
                         { type: "mrkdwn", text: `*Endurance*  (150 users / 30 min)\n${statusText(endurance)}` }
                       ]
                     },
-                    ...metricsBlocks,
-                    ...loadMetricsBlocks,
+                    ...baselineMetricBlocks,
+                    ...loadMetricBlocks,
                     { type: "divider" },
                     {
                       type: "section",
                       text: {
                         type: "mrkdwn",
-                        text: "*Performance Thresholds*\n• Avg Response Time: `< 2000ms`\n• Error Rate: `< 1%`\n• _(Checkout endpoint excluded from error rate — known 404 on demo env)_"
+                        text: "*Performance Thresholds*\n• Avg Response Time: `< 2000ms`\n• Error Rate: `< 1%`\n• _Checkout endpoint excluded from error rate — known 404 on demo env_"
                       }
                     },
                     {
                       type: "actions",
-                      elements: [
-                        {
-                          type: "button",
-                          text: { type: "plain_text", text: "View Full Run & Artifacts", emoji: true },
-                          url: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
-                          style: "primary"
-                        }
-                      ]
-                    },
-                    {
-                      type: "context",
-                      elements: [
-                        {
-                          type: "mrkdwn",
-                          text: `Run #${{ github.run_number }} • ${{ github.workflow }} • HTML reports available as artifacts for 30 days`
-                        }
-                      ]
-                    }
