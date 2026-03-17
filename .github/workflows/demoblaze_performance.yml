@@ -86,9 +86,10 @@ jobs:
         continue-on-error: true
 
       - name: Check Performance Thresholds
+        id: baseline-thresholds
         run: |
           python3 << 'EOF'
-          import csv, sys
+          import csv, sys, os
 
           jtl_file = "${{ env.RESULTS_DIR }}/baseline.jtl"
           error_count = 0
@@ -105,7 +106,7 @@ jobs:
               for row in reader:
                   label = row.get('label', '')
                   if EXCLUDED_SAMPLER in label:
-                      continue  # skip known broken endpoint
+                      continue
                   total_count += 1
                   elapsed = int(row.get('elapsed', 0))
                   total_elapsed += elapsed
@@ -124,6 +125,12 @@ jobs:
           print(f"Avg Response    : {avg_response:.0f}ms")
           print(f"Error Rate      : {error_rate:.2f}% (excl. Checkout 404)")
           print(f"Note: Checkout excluded — known 404 on DemoBlaze demo API")
+
+          # Write metrics to GITHUB_OUTPUT for use in Slack notification
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as fh:
+              print(f"avg_response={avg_response:.0f}", file=fh)
+              print(f"error_rate={error_rate:.2f}", file=fh)
+              print(f"total_requests={total_count}", file=fh)
 
           if avg_response > 2000:
               violations.append(f"FAIL: Avg response {avg_response:.0f}ms exceeds 2000ms threshold")
@@ -208,9 +215,10 @@ jobs:
         continue-on-error: true
 
       - name: Check Performance Thresholds
+        id: load-thresholds
         run: |
           python3 << 'EOF'
-          import csv, sys
+          import csv, sys, os
 
           jtl_file = "${{ env.RESULTS_DIR }}/load.jtl"
           error_count = 0
@@ -231,6 +239,11 @@ jobs:
           print(f"Total Requests  : {total_count}")
           print(f"Avg Response    : {avg_response:.0f}ms")
           print(f"Error Rate      : {error_rate:.2f}%")
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as fh:
+              print(f"avg_response={avg_response:.0f}", file=fh)
+              print(f"error_rate={error_rate:.2f}", file=fh)
+              print(f"total_requests={total_count}", file=fh)
 
           violations = []
           if avg_response > 2000:
@@ -403,7 +416,7 @@ jobs:
   notify:
     name: "Post Results Summary"
     runs-on: ubuntu-latest
-    needs: [baseline-test]   # ← only depend on baseline for PR events
+    needs: [baseline-test, load-test, stress-test, endurance-test]
     if: always() && !cancelled()
 
     steps:
@@ -411,13 +424,12 @@ jobs:
       - name: Build summary variables
         id: summary
         run: |
-          # Resolve each job result (skipped jobs show as 'skipped')
           BASELINE="${{ needs.baseline-test.result }}"
           LOAD="${{ needs.load-test.result }}"
           STRESS="${{ needs.stress-test.result }}"
           ENDURANCE="${{ needs.endurance-test.result }}"
 
-          # Overall status: failed/cancelled if any non-skipped job failed
+          # Overall status: failed if any non-skipped job failed
           OVERALL="passed"
           for RESULT in "$BASELINE" "$LOAD" "$STRESS" "$ENDURANCE"; do
             if [[ "$RESULT" == "failure" || "$RESULT" == "cancelled" ]]; then
@@ -432,14 +444,32 @@ jobs:
           echo "endurance=$ENDURANCE" >> $GITHUB_OUTPUT
           echo "overall=$OVERALL"     >> $GITHUB_OUTPUT
 
-          # Emoji helpers used in messages below
+          # Status icons for Slack text fields
+          status_icon() {
+            case "$1" in
+              success)   echo "✅ Passed"  ;;
+              failure)   echo "❌ Failed"  ;;
+              cancelled) echo "⚠️ Cancelled" ;;
+              *)         echo "⏭️ Skipped"  ;;
+            esac
+          }
+          echo "baseline_icon=$(status_icon $BASELINE)"   >> $GITHUB_OUTPUT
+          echo "load_icon=$(status_icon $LOAD)"           >> $GITHUB_OUTPUT
+          echo "stress_icon=$(status_icon $STRESS)"       >> $GITHUB_OUTPUT
+          echo "endurance_icon=$(status_icon $ENDURANCE)" >> $GITHUB_OUTPUT
+
           if [[ "$OVERALL" == "passed" ]]; then
-            echo "overall_emoji=✅" >> $GITHUB_OUTPUT
-            echo "slack_color=good" >> $GITHUB_OUTPUT
+            echo "overall_emoji=✅"    >> $GITHUB_OUTPUT
+            echo "slack_color=#2eb886" >> $GITHUB_OUTPUT   # green
+            echo "header_text=All Performance Gates Passed" >> $GITHUB_OUTPUT
           else
-            echo "overall_emoji=❌" >> $GITHUB_OUTPUT
-            echo "slack_color=danger" >> $GITHUB_OUTPUT
+            echo "overall_emoji=❌"    >> $GITHUB_OUTPUT
+            echo "slack_color=#e01e5a" >> $GITHUB_OUTPUT   # red
+            echo "header_text=Performance Gate Failure Detected" >> $GITHUB_OUTPUT
           fi
+
+          # Short commit SHA for display
+          echo "short_sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
 
       # ── 1. PR comment (pull_request events only) ──────────────
       - name: Post PR Comment with Results Summary
@@ -455,8 +485,8 @@ jobs:
             const emoji     = overall === "passed" ? "✅" : "❌";
 
             const statusIcon = (r) =>
-              r === "success"   ? "✅ PASSED"  :
-              r === "failure"   ? "❌ FAILED"  :
+              r === "success"   ? "✅ PASSED"    :
+              r === "failure"   ? "❌ FAILED"    :
               r === "cancelled" ? "⚠️ CANCELLED" : "⏭️ SKIPPED";
 
             const body = `## 🚀 DemoBlaze Performance Test Results — ${emoji} ${overall.toUpperCase()}
@@ -486,52 +516,113 @@ jobs:
             });
 
       # ── 2. Slack notification (all event types) ───────────────
-      # Requires secret: SLACK_WEBHOOK_URL
+      # Uses Block Kit for a structured, readable message matching
+      # the header + colored sidebar + fields layout from the screenshot.
+      #
+      # Required secret: SLACK_WEBHOOK_URL
       # Set up at: Slack → Apps → Incoming Webhooks → Add to Workspace
       - name: Notify Slack
         uses: slackapi/slack-github-action@v1.27.0
         with:
           payload: |
             {
-              "text": "*DemoBlaze Performance Tests — ${{ steps.summary.outputs.overall_emoji }} ${{ steps.summary.outputs.overall }}*",
               "attachments": [
                 {
                   "color": "${{ steps.summary.outputs.slack_color }}",
-                  "fields": [
+                  "blocks": [
                     {
-                      "title": "Baseline (50 users)",
-                      "value": "${{ steps.summary.outputs.baseline }}",
-                      "short": true
+                      "type": "header",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "${{ steps.summary.outputs.overall_emoji }} DemoBlaze Performance Tests — ${{ steps.summary.outputs.header_text }}",
+                        "emoji": true
+                      }
                     },
                     {
-                      "title": "Load (150 users)",
-                      "value": "${{ steps.summary.outputs.load }}",
-                      "short": true
+                      "type": "section",
+                      "fields": [
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Repository*\n${{ github.repository }}"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Branch*\n`${{ github.ref_name }}`"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Triggered By*\n${{ github.event_name }}"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Commit*\n`${{ steps.summary.outputs.short_sha }}`"
+                        }
+                      ]
                     },
                     {
-                      "title": "Stress (300 users)",
-                      "value": "${{ steps.summary.outputs.stress }}",
-                      "short": true
+                      "type": "divider"
                     },
                     {
-                      "title": "Endurance (150 users / 30 min)",
-                      "value": "${{ steps.summary.outputs.endurance }}",
-                      "short": true
+                      "type": "section",
+                      "text": {
+                        "type": "mrkdwn",
+                        "text": "*Test Results*"
+                      }
                     },
                     {
-                      "title": "Triggered By",
-                      "value": "${{ github.event_name }}",
-                      "short": true
+                      "type": "section",
+                      "fields": [
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Baseline* (50 users)\n${{ steps.summary.outputs.baseline_icon }}"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Load* (150 users)\n${{ steps.summary.outputs.load_icon }}"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Stress* (300 users)\n${{ steps.summary.outputs.stress_icon }}"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Endurance* (150 users / 30 min)\n${{ steps.summary.outputs.endurance_icon }}"
+                        }
+                      ]
                     },
                     {
-                      "title": "Branch",
-                      "value": "${{ github.ref_name }}",
-                      "short": true
+                      "type": "divider"
                     },
                     {
-                      "title": "Run URL",
-                      "value": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
-                      "short": false
+                      "type": "section",
+                      "text": {
+                        "type": "mrkdwn",
+                        "text": "*Performance Thresholds*\n• Avg Response Time: < 2000ms\n• Error Rate: < 1%"
+                      }
+                    },
+                    {
+                      "type": "actions",
+                      "elements": [
+                        {
+                          "type": "button",
+                          "text": {
+                            "type": "plain_text",
+                            "text": "View Full Run & Artifacts",
+                            "emoji": true
+                          },
+                          "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+                          "style": "primary"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "context",
+                      "elements": [
+                        {
+                          "type": "mrkdwn",
+                          "text": "Run #${{ github.run_number }} • ${{ github.workflow }} • HTML reports available as artifacts for 30 days"
+                        }
+                      ]
                     }
                   ]
                 }
@@ -563,12 +654,13 @@ jobs:
             Triggered By   : ${{ github.event_name }}
             Branch         : ${{ github.ref_name }}
             Commit         : ${{ github.sha }}
+            Run Number     : #${{ github.run_number }}
 
             ── Test Results ──────────────────────────────
-            Baseline  (50 users)          : ${{ steps.summary.outputs.baseline }}
-            Load      (150 users)         : ${{ steps.summary.outputs.load }}
-            Stress    (300 users)         : ${{ steps.summary.outputs.stress }}
-            Endurance (150 users / 30min) : ${{ steps.summary.outputs.endurance }}
+            Baseline  (50 users)          : ${{ steps.summary.outputs.baseline_icon }}
+            Load      (150 users)         : ${{ steps.summary.outputs.load_icon }}
+            Stress    (300 users)         : ${{ steps.summary.outputs.stress_icon }}
+            Endurance (150 users / 30min) : ${{ steps.summary.outputs.endurance_icon }}
 
             ── Thresholds Applied ────────────────────────
             Avg Response Time : < 2000ms
