@@ -476,24 +476,25 @@ jobs:
               r === "failure"   ? "❌ FAILED"    :
               r === "cancelled" ? "⚠️ CANCELLED" : "⏭️ SKIPPED";
 
-            const body = `## 🚀 DemoBlaze Performance Test Results — ${emoji} ${overall.toUpperCase()}
-
-            | Test | Users | Status |
-            |------|-------|--------|
-            | Baseline  | 50  | ${statusIcon(baseline)}  |
-            | Load      | 150 | ${statusIcon(load)}      |
-            | Stress    | 300 | ${statusIcon(stress)}    |
-            | Endurance | 150 | ${statusIcon(endurance)} |
-
-            ### Thresholds Applied
-            | Metric | Target |
-            |--------|--------|
-            | Avg Response Time | < 2000ms |
-            | Error Rate | < 1% |
-
-            📊 Download full HTML Dashboard reports from **Actions → Artifacts**.
-            🔗 [View Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
-            `;
+            const body = [
+              "## 🚀 DemoBlaze Performance Test Results — " + emoji + " " + overall.toUpperCase(),
+              "",
+              "| Test | Users | Status |",
+              "|------|-------|--------|",
+              "| Baseline  | 50  | " + statusIcon(baseline)  + " |",
+              "| Load      | 150 | " + statusIcon(load)      + " |",
+              "| Stress    | 300 | " + statusIcon(stress)    + " |",
+              "| Endurance | 150 | " + statusIcon(endurance) + " |",
+              "",
+              "### Thresholds Applied",
+              "| Metric | Target |",
+              "|--------|--------|",
+              "| Avg Response Time | < 2000ms |",
+              "| Error Rate | < 1% |",
+              "",
+              "📊 Download full HTML Dashboard reports from **Actions → Artifacts**.",
+              "🔗 [View Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+            ].join("\n");
 
             github.rest.issues.createComment({
               issue_number: context.issue.number,
@@ -502,12 +503,177 @@ jobs:
               body: body
             });
 
-      # ── 2. Build Slack payload ─────────────────────────────────
-      # All ${{ }} expressions are resolved into env vars BEFORE the
-      # JS runs, so the JS engine never sees raw }} sequences.
+      # ── 2. Build Slack payload using Python (no JS syntax issues) ──
+      # Python writes a JSON file; the Slack action reads it directly.
       - name: Build Slack payload
         id: slack-payload
-        uses: actions/github-script@v7
+        run: |
+          python3 << 'PYEOF'
+          import json, os
+
+          def fmt(val, unit="ms"):
+              return f"{val}{unit}" if val else "N/A"
+
+          overall         = os.environ.get("OVERALL", "failed")
+          short_sha       = os.environ.get("SHORT_SHA", "unknown")
+          baseline        = os.environ.get("BASELINE_RESULT", "skipped")
+          load            = os.environ.get("LOAD_RESULT", "skipped")
+          stress          = os.environ.get("STRESS_RESULT", "skipped")
+          endurance       = os.environ.get("ENDURANCE_RESULT", "skipped")
+          trigger         = os.environ.get("TRIGGER", "")
+          repo            = os.environ.get("REPO", "")
+          branch          = os.environ.get("BRANCH", "")
+          run_url         = os.environ.get("RUN_URL", "")
+          run_number      = os.environ.get("RUN_NUMBER", "")
+          workflow        = os.environ.get("WORKFLOW", "")
+
+          b_avg    = fmt(os.environ.get("B_AVG"))
+          b_err    = fmt(os.environ.get("B_ERR"), "%")
+          b_total  = os.environ.get("B_TOTAL") or "N/A"
+          b_p90    = fmt(os.environ.get("B_P90"))
+          b_p95    = fmt(os.environ.get("B_P95"))
+          b_p99    = fmt(os.environ.get("B_P99"))
+          b_min    = fmt(os.environ.get("B_MIN"))
+          b_max    = fmt(os.environ.get("B_MAX"))
+          b_errors = os.environ.get("B_ERRORS") or "N/A"
+
+          l_avg    = fmt(os.environ.get("L_AVG"))
+          l_err    = fmt(os.environ.get("L_ERR"), "%")
+          l_total  = os.environ.get("L_TOTAL") or "N/A"
+          l_p90    = fmt(os.environ.get("L_P90"))
+          l_p95    = fmt(os.environ.get("L_P95"))
+
+          passed       = overall == "passed"
+          color        = "#2eb886" if passed else "#e01e5a"
+          header_emoji = "✅" if passed else "❌"
+          header_label = "All Performance Gates Passed" if passed else "Performance Gate Failure Detected"
+
+          trigger_labels = {
+              "push":              "Push",
+              "pull_request":      "Pull Request",
+              "schedule":          "Scheduled (Nightly)",
+              "workflow_dispatch": "Manual Trigger",
+          }
+          trigger_label = trigger_labels.get(trigger, trigger)
+
+          def status_text(r):
+              return {
+                  "success":   "✅  Passed",
+                  "failure":   "❌  Failed",
+                  "cancelled": "⚠️  Cancelled",
+              }.get(r, "⏭️  Skipped")
+
+          blocks = [
+              {
+                  "type": "header",
+                  "text": {
+                      "type": "plain_text",
+                      "text": f"{header_emoji}  DemoBlaze Performance Tests — {header_label}",
+                      "emoji": True
+                  }
+              },
+              {
+                  "type": "section",
+                  "fields": [
+                      {"type": "mrkdwn", "text": f"*Repository*\n{repo}"},
+                      {"type": "mrkdwn", "text": f"*Branch*\n`{branch}`"},
+                      {"type": "mrkdwn", "text": f"*Triggered By*\n{trigger_label}"},
+                      {"type": "mrkdwn", "text": f"*Commit*\n`{short_sha}`"},
+                  ]
+              },
+              {"type": "divider"},
+              {
+                  "type": "section",
+                  "text": {"type": "mrkdwn", "text": "*Test Results*"}
+              },
+              {
+                  "type": "section",
+                  "fields": [
+                      {"type": "mrkdwn", "text": f"*Baseline*  (50 users)\n{status_text(baseline)}"},
+                      {"type": "mrkdwn", "text": f"*Load*  (150 users)\n{status_text(load)}"},
+                      {"type": "mrkdwn", "text": f"*Stress*  (300 users)\n{status_text(stress)}"},
+                      {"type": "mrkdwn", "text": f"*Endurance*  (150 users / 30 min)\n{status_text(endurance)}"},
+                  ]
+              },
+          ]
+
+          # Baseline metrics block — only when the job actually ran
+          if baseline in ("success", "failure"):
+              blocks += [
+                  {"type": "divider"},
+                  {"type": "section", "text": {"type": "mrkdwn", "text": "*📊 Baseline Metrics  (50 users)*"}},
+                  {
+                      "type": "section",
+                      "fields": [
+                          {"type": "mrkdwn", "text": f"*Total Requests*\n{b_total}"},
+                          {"type": "mrkdwn", "text": f"*Errors*\n{b_errors}"},
+                          {"type": "mrkdwn", "text": f"*Avg Response*\n{b_avg}"},
+                          {"type": "mrkdwn", "text": f"*Error Rate*\n{b_err}"},
+                          {"type": "mrkdwn", "text": f"*P90 / P95 / P99*\n{b_p90} / {b_p95} / {b_p99}"},
+                          {"type": "mrkdwn", "text": f"*Min / Max*\n{b_min} / {b_max}"},
+                      ]
+                  },
+              ]
+
+          # Load metrics block — only when the job actually ran
+          if load in ("success", "failure"):
+              blocks += [
+                  {"type": "divider"},
+                  {"type": "section", "text": {"type": "mrkdwn", "text": "*📊 Load Metrics  (150 users)*"}},
+                  {
+                      "type": "section",
+                      "fields": [
+                          {"type": "mrkdwn", "text": f"*Total Requests*\n{l_total}"},
+                          {"type": "mrkdwn", "text": f"*Avg Response*\n{l_avg}"},
+                          {"type": "mrkdwn", "text": f"*Error Rate*\n{l_err}"},
+                          {"type": "mrkdwn", "text": f"*P90 / P95*\n{l_p90} / {l_p95}"},
+                      ]
+                  },
+              ]
+
+          blocks += [
+              {"type": "divider"},
+              {
+                  "type": "section",
+                  "text": {
+                      "type": "mrkdwn",
+                      "text": (
+                          "*Performance Thresholds*\n"
+                          "• Avg Response Time: `< 2000ms`\n"
+                          "• Error Rate: `< 1%`\n"
+                          "• _Checkout endpoint excluded from error rate — known 404 on demo env_"
+                      )
+                  }
+              },
+              {
+                  "type": "actions",
+                  "elements": [
+                      {
+                          "type": "button",
+                          "text": {"type": "plain_text", "text": "View Full Run & Artifacts", "emoji": True},
+                          "url": run_url,
+                          "style": "primary"
+                      }
+                  ]
+              },
+              {
+                  "type": "context",
+                  "elements": [
+                      {
+                          "type": "mrkdwn",
+                          "text": f"Run #{run_number} • {workflow} • HTML reports available as artifacts for 30 days"
+                      }
+                  ]
+              },
+          ]
+
+          payload = {"attachments": [{"color": color, "blocks": blocks}]}
+
+          with open("slack_payload.json", "w") as f:
+              json.dump(payload, f)
+
+          print("Slack payload written to slack_payload.json")
+          PYEOF
         env:
           OVERALL:          ${{ steps.summary.outputs.overall }}
           SHORT_SHA:        ${{ steps.summary.outputs.short_sha }}
@@ -521,157 +687,4 @@ jobs:
           RUN_URL:          ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           RUN_NUMBER:       ${{ github.run_number }}
           WORKFLOW:         ${{ github.workflow }}
-          # Baseline metrics (empty string when job was skipped)
-          B_AVG:    ${{ needs.baseline-test.outputs.avg_response }}
-          B_ERR:    ${{ needs.baseline-test.outputs.error_rate }}
-          B_TOTAL:  ${{ needs.baseline-test.outputs.total_requests }}
-          B_P90:    ${{ needs.baseline-test.outputs.p90 }}
-          B_P95:    ${{ needs.baseline-test.outputs.p95 }}
-          B_P99:    ${{ needs.baseline-test.outputs.p99 }}
-          B_MIN:    ${{ needs.baseline-test.outputs.min_response }}
-          B_MAX:    ${{ needs.baseline-test.outputs.max_response }}
-          B_ERRORS: ${{ needs.baseline-test.outputs.error_count }}
-          # Load metrics
-          L_AVG:    ${{ needs.load-test.outputs.avg_response }}
-          L_ERR:    ${{ needs.load-test.outputs.error_rate }}
-          L_TOTAL:  ${{ needs.load-test.outputs.total_requests }}
-          L_P90:    ${{ needs.load-test.outputs.p90 }}
-          L_P95:    ${{ needs.load-test.outputs.p95 }}
-        with:
-          script: |
-            const overall         = process.env.OVERALL;
-            const shortSha        = process.env.SHORT_SHA;
-            const baseline        = process.env.BASELINE_RESULT;
-            const load            = process.env.LOAD_RESULT;
-            const stress          = process.env.STRESS_RESULT;
-            const endurance       = process.env.ENDURANCE_RESULT;
-            const trigger         = process.env.TRIGGER;
-            const repo            = process.env.REPO;
-            const branch          = process.env.BRANCH;
-            const runUrl          = process.env.RUN_URL;
-            const runNumber       = process.env.RUN_NUMBER;
-            const workflow        = process.env.WORKFLOW;
-
-            const fmt = (v, unit) => v ? `${v}${unit}` : 'N/A';
-
-            const bAvg    = fmt(process.env.B_AVG,    'ms');
-            const bErr    = fmt(process.env.B_ERR,    '%');
-            const bTotal  = process.env.B_TOTAL  || 'N/A';
-            const bP90    = fmt(process.env.B_P90,    'ms');
-            const bP95    = fmt(process.env.B_P95,    'ms');
-            const bP99    = fmt(process.env.B_P99,    'ms');
-            const bMin    = fmt(process.env.B_MIN,    'ms');
-            const bMax    = fmt(process.env.B_MAX,    'ms');
-            const bErrors = process.env.B_ERRORS || 'N/A';
-
-            const lAvg    = fmt(process.env.L_AVG,    'ms');
-            const lErr    = fmt(process.env.L_ERR,    '%');
-            const lTotal  = process.env.L_TOTAL  || 'N/A';
-            const lP90    = fmt(process.env.L_P90,    'ms');
-            const lP95    = fmt(process.env.L_P95,    'ms');
-
-            const passed = overall === "passed";
-            const color  = passed ? "#2eb886" : "#e01e5a";
-
-            const headerLabel = passed
-              ? "All Performance Gates Passed"
-              : "Performance Gate Failure Detected";
-
-            const headerEmoji = passed ? "✅" : "❌";
-
-            const triggerLabel = {
-              push:              "Push",
-              pull_request:      "Pull Request",
-              schedule:          "Scheduled (Nightly)",
-              workflow_dispatch: "Manual Trigger"
-            }[trigger] || trigger;
-
-            const statusText = (r) =>
-              r === "success"   ? "✅  Passed"    :
-              r === "failure"   ? "❌  Failed"    :
-              r === "cancelled" ? "⚠️  Cancelled" : "⏭️  Skipped";
-
-            const baselineMetricBlocks = (baseline === "success" || baseline === "failure") ? [
-              { type: "divider" },
-              {
-                type: "section",
-                text: { type: "mrkdwn", text: "*📊 Baseline Metrics  (50 users)*" }
-              },
-              {
-                type: "section",
-                fields: [
-                  { type: "mrkdwn", text: `*Total Requests*\n${bTotal}` },
-                  { type: "mrkdwn", text: `*Errors*\n${bErrors}` },
-                  { type: "mrkdwn", text: `*Avg Response*\n${bAvg}` },
-                  { type: "mrkdwn", text: `*Error Rate*\n${bErr}` },
-                  { type: "mrkdwn", text: `*P90 / P95 / P99*\n${bP90} / ${bP95} / ${bP99}` },
-                  { type: "mrkdwn", text: `*Min / Max*\n${bMin} / ${bMax}` }
-                ]
-              }
-            ] : [];
-
-            const loadMetricBlocks = (load === "success" || load === "failure") ? [
-              { type: "divider" },
-              {
-                type: "section",
-                text: { type: "mrkdwn", text: "*📊 Load Metrics  (150 users)*" }
-              },
-              {
-                type: "section",
-                fields: [
-                  { type: "mrkdwn", text: `*Total Requests*\n${lTotal}` },
-                  { type: "mrkdwn", text: `*Avg Response*\n${lAvg}` },
-                  { type: "mrkdwn", text: `*Error Rate*\n${lErr}` },
-                  { type: "mrkdwn", text: `*P90 / P95*\n${lP90} / ${lP95}` }
-                ]
-              }
-            ] : [];
-
-            const payload = {
-              attachments: [
-                {
-                  color,
-                  blocks: [
-                    {
-                      type: "header",
-                      text: {
-                        type: "plain_text",
-                        text: `${headerEmoji}  DemoBlaze Performance Tests — ${headerLabel}`,
-                        emoji: true
-                      }
-                    },
-                    {
-                      type: "section",
-                      fields: [
-                        { type: "mrkdwn", text: `*Repository*\n${repo}` },
-                        { type: "mrkdwn", text: `*Branch*\n\`${branch}\`` },
-                        { type: "mrkdwn", text: `*Triggered By*\n${triggerLabel}` },
-                        { type: "mrkdwn", text: `*Commit*\n\`${shortSha}\`` }
-                      ]
-                    },
-                    { type: "divider" },
-                    {
-                      type: "section",
-                      text: { type: "mrkdwn", text: "*Test Results*" }
-                    },
-                    {
-                      type: "section",
-                      fields: [
-                        { type: "mrkdwn", text: `*Baseline*  (50 users)\n${statusText(baseline)}` },
-                        { type: "mrkdwn", text: `*Load*  (150 users)\n${statusText(load)}` },
-                        { type: "mrkdwn", text: `*Stress*  (300 users)\n${statusText(stress)}` },
-                        { type: "mrkdwn", text: `*Endurance*  (150 users / 30 min)\n${statusText(endurance)}` }
-                      ]
-                    },
-                    ...baselineMetricBlocks,
-                    ...loadMetricBlocks,
-                    { type: "divider" },
-                    {
-                      type: "section",
-                      text: {
-                        type: "mrkdwn",
-                        text: "*Performance Thresholds*\n• Avg Response Time: `< 2000ms`\n• Error Rate: `< 1%`\n• _Checkout endpoint excluded from error rate — known 404 on demo env_"
-                      }
-                    },
-                    {
-                      type: "actions",
+          B_AVG:            $
